@@ -4,11 +4,11 @@ Thank you for your interest in our work. This repository maintains code for NeRF
 
 ![NeRF2 Example](https://github.com/XPengZhao/NeRF2/blob/gh-pages/static/images/spt-predict.jpg?raw=true)
 
-## [Project](https://xpengzhao.github.io/NeRF2/) | [Paper](https://dl.acm.org/doi/10.1145/3570361.3592527) | Datasets
+## [Project](https://xpengzhao.github.io/NeRF2/) | [Paper](https://dl.acm.org/doi/10.1145/3570361.3592527) | [Datasets](https://1drv.ms/f/c/60d52909f2b04a6c/EtgHuC4t6xpFo1tsXzgQQfcBgoyrgZkkVwf9wcX8qxJsjQ?e=hMeEXQ)
 
 ### RFID spectrum / BLE / MIMO  prediction
 
-Datasets and pretrained models are available at [Here](https://connectpolyu-my.sharepoint.com/:f:/g/personal/20032132r_connect_polyu_hk/EuAACSdRP4VGgw_9n2IqL84BkY_tWD5TeE9kDT0lvjw6jw?e=ygYEvX).
+Datasets and pretrained models are available at [Here](https://1drv.ms/f/c/60d52909f2b04a6c/EtgHuC4t6xpFo1tsXzgQQfcBgoyrgZkkVwf9wcX8qxJsjQ?e=hMeEXQ).
 
 The datasets are organized as follows:
 
