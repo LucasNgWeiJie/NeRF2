@@ -1,8 +1,8 @@
 
 ### Path settings
 path:
-  expname: mimo-csi-exp1
-  datadir: data/MIMO/
+  expname: mimo-csi-generated
+  datadir: data/MIMO/rt_csi
   logdir: logs/MIMO/
 
 
@@ -22,7 +22,7 @@ train:
   T_max: 10000
   eta_min: 1e-6
   batch_size: 64
-  total_iterations: 70000
+  total_iterations: 500
   load_ckpt: True
 
   save_freq: 100

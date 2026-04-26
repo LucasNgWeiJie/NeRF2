@@ -18,13 +18,15 @@ from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 from tqdm import tqdm, trange
 import scipy.io as scio
-
+import time
 from dataloader import *
 from model import *
 from renderer import renderer_dict
 from utils.data_painter import paint_spectrum_compare
 from utils.logger import logger_config
 
+# personal evaluator
+from evaluator import ComprehensiveEvaluator, BeamformingEvaluator
 
 class NeRF2_Runner():
 
@@ -49,6 +51,13 @@ class NeRF2_Runner():
         self.logger.info("expname:%s, datadir:%s, logdir:%s", self.expname, self.datadir, self.logdir)
         self.writer = SummaryWriter(os.path.join(self.logdir, self.expname, 'tensorboard'))
 
+        # Initialize comprehensive evaluator
+        self.comprehensive_evaluator = ComprehensiveEvaluator(
+            logger=self.logger,
+            logdir=self.logdir,
+            expname=self.expname,
+            devices=self.devices
+        )
 
         ## Networks
         self.nerf2_network = NeRF2(**kwargs_network).to(self.devices)
@@ -80,17 +89,24 @@ class NeRF2_Runner():
         ## Dataset
         dataset = dataset_dict[dataset_type]
         train_index = os.path.join(self.datadir, "train_index.txt")
+        val_index = os.path.join(self.datadir, "val_index.txt")
         test_index = os.path.join(self.datadir, "test_index.txt")
-        if not os.path.exists(train_index) or not os.path.exists(test_index):
-            split_dataset(self.datadir, ratio=0.8, dataset_type=dataset_type)
+
+        if not os.path.exists(train_index) or not os.path.exists(test_index) or not os.path.exists(val_index):
+            split_dataset(self.datadir, ratio=0.8, val_ratio=0.15, dataset_type=dataset_type)
+
         self.logger.info("Loading training set...")
         self.train_set = dataset(self.datadir, train_index, self.scale_worldsize)
+        self.logger.info("Loading validation set...")
+        self.val_set = dataset(self.datadir, val_index, self.scale_worldsize)
         self.logger.info("Loading test set...")
         self.test_set = dataset(self.datadir, test_index, self.scale_worldsize)
 
         self.train_iter = DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=0)
+        self.val_iter = DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, num_workers=0)
         self.test_iter = DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=0)
-        self.logger.info("Train set size:%d, Test set size:%d", len(self.train_set), len(self.test_set))
+        self.logger.info("Train set size:%d, Val set size:%d, Test set size:%d", 
+                        len(self.train_set), len(self.val_set), len(self.test_set))
 
 
     def load_checkpoints(self):
@@ -134,6 +150,7 @@ class NeRF2_Runner():
         """train the model
         """
         self.logger.info("Start training. Current Iteration:%d", self.current_iteration)
+        start_time = time.time()
         while self.current_iteration <= self.total_iterations:
             with tqdm(total=len(self.train_iter), desc=f"Iteration {self.current_iteration}/{self.total_iterations}") as pbar:
                 for train_input, train_label in self.train_iter:
@@ -155,14 +172,13 @@ class NeRF2_Runner():
                         predict_downlink = torch.concat((predict_downlink.real, predict_downlink.imag), dim=-1)
                         loss = sig2mse(predict_downlink, train_label)
 
-
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
                     self.cosine_scheduler.step()
                     self.current_iteration += 1
 
-                    self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
+                    self.writer.add_scalar('Loss/train_loss', loss, self.current_iteration)
                     pbar.update(1)
                     pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
                     pbar.set_postfix_str('loss = {:.6f}, lr = {:.6f}'.format(loss.item(), self.optimizer.param_groups[0]['lr']))
@@ -171,7 +187,83 @@ class NeRF2_Runner():
                         ckptname = self.save_checkpoint()
                         pbar.write('Saved checkpoints at {}'.format(ckptname))
 
+                        # --- Validation loop ---
+                        self.nerf2_network.eval()
+                        val_losses = []
+                        with torch.no_grad():
+                            for val_input, val_label in self.val_iter:
+                                val_input, val_label = val_input.to(self.devices), val_label.to(self.devices)
+                                if self.dataset_type == "rfid":
+                                    rays_o, rays_d, tx_o = val_input[:, :3], val_input[:, 3:6], val_input[:, 6:9]
+                                    predict = self.renderer.render_ss(tx_o, rays_o, rays_d)
+                                    val_loss = sig2mse(predict, val_label.view(-1))
+                                elif self.dataset_type == 'ble':
+                                    tx_o, rays_o, rays_d = val_input[:, :3], val_input[:, 3:6], val_input[:, 6:]
+                                    predict = self.renderer.render_rssi(tx_o, rays_o, rays_d)
+                                    val_loss = sig2mse(predict, val_label.view(-1))
+                                elif self.dataset_type == 'mimo':
+                                    uplink, rays_o, rays_d = val_input[:, :52], val_input[:, 52:55], val_input[:, 55:]
+                                    predict = self.renderer.render_csi(uplink, rays_o, rays_d)
+                                    predict = torch.concat((predict.real, predict.imag), dim=-1)
+                                    val_loss = sig2mse(predict, val_label)
+                                val_losses.append(val_loss.item())
 
+                        avg_val_loss = np.mean(val_losses)
+                        self.writer.add_scalar('Loss/val_loss', avg_val_loss, self.current_iteration)
+                        self.logger.info("Iteration %d | Val Loss: %.6f", self.current_iteration, avg_val_loss)
+                        pbar.write('Val loss: {:.6f}'.format(avg_val_loss))
+                        self.nerf2_network.train()
+                        # --- End validation loop ---
+
+        end_time = time.time()
+        total_time = end_time - start_time
+        self.logger.info("Training completed in {:.2f} hours".format(total_time / 3600))
+
+    # def train(self):
+    #     """train the model
+    #     """
+    #     self.logger.info("Start training. Current Iteration:%d", self.current_iteration)
+    #     start_time = time.time() #record start time for training
+    #     while self.current_iteration <= self.total_iterations:
+    #         with tqdm(total=len(self.train_iter), desc=f"Iteration {self.current_iteration}/{self.total_iterations}") as pbar:
+    #             for train_input, train_label in self.train_iter:
+    #                 if self.current_iteration > self.total_iterations:
+    #                     break
+
+    #                 train_input, train_label = train_input.to(self.devices), train_label.to(self.devices)
+    #                 if self.dataset_type == "rfid":
+    #                     rays_o, rays_d, tx_o = train_input[:, :3], train_input[:, 3:6], train_input[:, 6:9]
+    #                     predict_spectrum = self.renderer.render_ss(tx_o, rays_o, rays_d)
+    #                     loss = sig2mse(predict_spectrum, train_label.view(-1))
+    #                 elif self.dataset_type == 'ble':
+    #                     tx_o, rays_o, rays_d = train_input[:, :3], train_input[:, 3:6], train_input[:, 6:]
+    #                     predict_rssi = self.renderer.render_rssi(tx_o, rays_o, rays_d)
+    #                     loss = sig2mse(predict_rssi, train_label.view(-1))
+    #                 elif self.dataset_type == 'mimo':
+    #                     uplink, rays_o, rays_d = train_input[:, :52], train_input[:, 52:55], train_input[:, 55:]
+    #                     predict_downlink = self.renderer.render_csi(uplink, rays_o, rays_d)
+    #                     predict_downlink = torch.concat((predict_downlink.real, predict_downlink.imag), dim=-1)
+    #                     loss = sig2mse(predict_downlink, train_label)
+
+
+    #                 self.optimizer.zero_grad()
+    #                 loss.backward()
+    #                 self.optimizer.step()
+    #                 self.cosine_scheduler.step()
+    #                 self.current_iteration += 1
+
+    #                 self.writer.add_scalar('Loss/loss', loss, self.current_iteration)
+    #                 pbar.update(1)
+    #                 pbar.set_description(f"Iteration {self.current_iteration}/{self.total_iterations}")
+    #                 pbar.set_postfix_str('loss = {:.6f}, lr = {:.6f}'.format(loss.item(), self.optimizer.param_groups[0]['lr']))
+
+    #                 if self.current_iteration % self.save_freq == 0:
+    #                     ckptname = self.save_checkpoint()
+    #                     pbar.write('Saved checkpoints at {}'.format(ckptname))
+
+    #     end_time = time.time() #record end time for training
+    #     total_time = end_time - start_time
+    #     self.logger.info("Training completed in {:.2f} hours".format(total_time / 3600))
 
     def eval_network_spectrum(self):
         """test the model
@@ -214,69 +306,153 @@ class NeRF2_Runner():
 
 
 
+    # def eval_network_rssi(self):
+    #     """test the model and save predicted RSSI values to a file
+    #     """
+    #     self.logger.info("Start evaluation")
+    #     self.nerf2_network.eval()
+
+    #     with torch.no_grad():
+    #         with open(os.path.join(self.logdir, self.expname, "result.txt"), 'w') as f:
+    #             for test_input, test_label in self.test_iter:
+    #                 test_input, test_label = test_input.to(self.devices), test_label.to(self.devices)
+    #                 tx_o, rays_o, rays_d = test_input[:, :3], test_input[:, 3:6], test_input[:, 6:]
+    #                 predict_rssi = self.renderer.render_rssi(tx_o, rays_o, rays_d)
+
+    #                 ## save predicted spectrum
+    #                 predict_rssi = amplitude2rssi(predict_rssi.detach().cpu())
+    #                 gt_rssi = amplitude2rssi(test_label.detach().cpu())
+
+    #                 error = abs(predict_rssi - gt_rssi.reshape(-1))
+    #                 self.logger.info("Median error:%.2f", torch.median(error))
+
+    #                 # write predicted RSSI values to file
+    #                 for i, rssi in enumerate(predict_rssi):
+    #                     f.write("{:.2f}, {:.2f}".format(gt_rssi[i].item(), rssi.item()) + '\n')
+
+    #     result = np.loadtxt(os.path.join(self.logdir,self.expname, "result.txt"), delimiter=",")
+    #     self.logger.info("Total Median error:%.2f", np.median(abs(result[:,0] - result[:,1])))
+
     def eval_network_rssi(self):
-        """test the model and save predicted RSSI values to a file
         """
-        self.logger.info("Start evaluation")
-        self.nerf2_network.eval()
+        Comprehensive evaluation with detailed metrics and visualizations
+        """
+        metrics = self.comprehensive_evaluator.eval_network_rssi_comprehensive(
+            nerf2_network=self.nerf2_network,
+            renderer=self.renderer,
+            test_iter=self.test_iter,
+            gateway_positions=None,  # Add gateway positions if you have them
+            save_plots=True
+        )
+        
+        return metrics
 
-        with torch.no_grad():
-            with open(os.path.join(self.logdir, self.expname, "result.txt"), 'w') as f:
-                for test_input, test_label in self.test_iter:
-                    test_input, test_label = test_input.to(self.devices), test_label.to(self.devices)
-                    tx_o, rays_o, rays_d = test_input[:, :3], test_input[:, 3:6], test_input[:, 6:]
-                    predict_rssi = self.renderer.render_rssi(tx_o, rays_o, rays_d)
+    # def eval_network_csi(self):
+    #     """test the model and save predicted csi values to a file
+    #     """
+    #     self.logger.info("Start evaluation")
+    #     self.nerf2_network.eval()
 
-                    ## save predicted spectrum
-                    predict_rssi = amplitude2rssi(predict_rssi.detach().cpu())
-                    gt_rssi = amplitude2rssi(test_label.detach().cpu())
+    #     n_bs = self.test_set.n_bs    # number of base station antennas
+    #     n_data = len(self.test_set)  # number of test data
 
-                    error = abs(predict_rssi - gt_rssi.reshape(-1))
-                    self.logger.info("Median error:%.2f", torch.median(error))
+    #     all_pred_csi = torch.zeros((n_data, 26), dtype=torch.complex64)
+    #     all_gt_csi = torch.zeros((n_data, 26), dtype=torch.complex64)
+    #     with torch.no_grad():
+    #         for idx, (test_input, test_label) in enumerate(self.test_iter):
+    #             test_input, test_label = test_input.to(self.devices), test_label.to(self.devices)
+    #             uplink, rays_o, rays_d = test_input[:, :52], test_input[:, 52:55], test_input[:, 55:]
+    #             predict_downlink = self.renderer.render_csi(uplink, rays_o, rays_d)  # [B, 26]
+    #             gt_downlink = test_label[:, :26] + 1j * test_label[:, 26:]
+    #             predict_downlink = self.test_set.denormalize_csi(predict_downlink)
+    #             gt_downlink = self.test_set.denormalize_csi(gt_downlink)
 
-                    # write predicted RSSI values to file
-                    for i, rssi in enumerate(predict_rssi):
-                        f.write("{:.2f}, {:.2f}".format(gt_rssi[i].item(), rssi.item()) + '\n')
+    #             all_pred_csi[idx*self.batch_size:(idx+1)*self.batch_size] = predict_downlink
+    #             all_gt_csi[idx*self.batch_size:(idx+1)*self.batch_size] = gt_downlink
 
-        result = np.loadtxt(os.path.join(self.logdir,self.expname, "result.txt"), delimiter=",")
-        self.logger.info("Total Median error:%.2f", np.median(abs(result[:,0] - result[:,1])))
+    #     all_pred_csi = rearrange(all_pred_csi, '(n_data n_bs) channel -> n_data n_bs channel', n_bs=n_bs)
+    #     all_gt_csi = rearrange(all_gt_csi, '(n_data n_bs) channel -> n_data n_bs channel', n_bs=n_bs)
+    #     snr = csi2snr(all_pred_csi, all_gt_csi)
+    #     self.logger.info("Median SNR:%.2f", torch.median(snr))
 
+    #     scio.savemat(os.path.join(self.logdir, self.expname, "result.mat"), {'pred_csi': all_pred_csi.cpu().numpy(),
+    #                                                                           'gt_csi': all_gt_csi.cpu().numpy(),
+    #                                                                           'snr': snr.cpu().numpy()})
 
 
     def eval_network_csi(self):
-        """test the model and save predicted csi values to a file
-        """
+        """Evaluate CSI prediction: SNR, beam accuracy, latency vs ray-tracing."""
         self.logger.info("Start evaluation")
         self.nerf2_network.eval()
 
-        n_bs = self.test_set.n_bs    # number of base station antennas
-        n_data = len(self.test_set)  # number of test data
+        n_bs   = self.test_set.n_bs
+        n_data = len(self.test_set)
 
-        all_pred_csi = torch.zeros((n_data, 26), dtype=torch.complex64)
-        all_gt_csi = torch.zeros((n_data, 26), dtype=torch.complex64)
+        all_pred_csi    = torch.zeros((n_data, 26), dtype=torch.complex64)
+        all_gt_csi      = torch.zeros((n_data, 26), dtype=torch.complex64)
+        inference_times = []
+
         with torch.no_grad():
             for idx, (test_input, test_label) in enumerate(self.test_iter):
                 test_input, test_label = test_input.to(self.devices), test_label.to(self.devices)
                 uplink, rays_o, rays_d = test_input[:, :52], test_input[:, 52:55], test_input[:, 55:]
+
+                # --- Time inference ---
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t0 = time.time()
+
                 predict_downlink = self.renderer.render_csi(uplink, rays_o, rays_d)  # [B, 26]
-                gt_downlink = test_label[:, :26] + 1j * test_label[:, 26:]
+
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                elapsed = time.time() - t0
+                inference_times.extend([elapsed / test_input.shape[0]] * test_input.shape[0])
+                # ---------------------
+
+                gt_downlink      = test_label[:, :26] + 1j * test_label[:, 26:]
                 predict_downlink = self.test_set.denormalize_csi(predict_downlink)
-                gt_downlink = self.test_set.denormalize_csi(gt_downlink)
+                gt_downlink      = self.test_set.denormalize_csi(gt_downlink)
 
                 all_pred_csi[idx*self.batch_size:(idx+1)*self.batch_size] = predict_downlink
-                all_gt_csi[idx*self.batch_size:(idx+1)*self.batch_size] = gt_downlink
+                all_gt_csi  [idx*self.batch_size:(idx+1)*self.batch_size] = gt_downlink
 
-        all_pred_csi = rearrange(all_pred_csi, '(n_data n_bs) channel -> n_data n_bs channel', n_bs=n_bs)
-        all_gt_csi = rearrange(all_gt_csi, '(n_data n_bs) channel -> n_data n_bs channel', n_bs=n_bs)
+        # Rearrange to (n_tx, n_bs, 26)
+        all_pred_csi = rearrange(all_pred_csi, '(n_data n_bs) c -> n_data n_bs c', n_bs=n_bs)
+        all_gt_csi   = rearrange(all_gt_csi,   '(n_data n_bs) c -> n_data n_bs c', n_bs=n_bs)
+
+        # --- Original SNR metric (keep for continuity) ---
         snr = csi2snr(all_pred_csi, all_gt_csi)
-        self.logger.info("Median SNR:%.2f", torch.median(snr))
+        self.logger.info("Median SNR: %.2f", torch.median(snr))
 
-        scio.savemat(os.path.join(self.logdir, self.expname, "result.mat"), {'pred_csi': all_pred_csi.cpu().numpy(),
-                                                                              'gt_csi': all_gt_csi.cpu().numpy(),
-                                                                              'snr': snr.cpu().numpy()})
+        # --- Beamforming evaluation ---
+        evaluator = BeamformingEvaluator(
+            logger      = self.logger,
+            logdir      = self.logdir,
+            expname     = self.expname,
+            bs_yml_path = self.test_set.bs_pos_dir,   # already loaded in dataset
+            oversampling = 2
+        )
+        results = evaluator.eval_beamforming_from_csi(
+            pred_csi        = all_pred_csi.cpu().numpy(),   # (n_tx, n_bs, 26) complex
+            gt_csi          = all_gt_csi.cpu().numpy(),     # (n_tx, n_bs, 26) complex
+            inference_times = inference_times,
+            save_plots      = True
+        )
 
-
-
+        # --- Save results ---
+        scio.savemat(
+            os.path.join(self.logdir, self.expname, "result.mat"),
+            {
+                'pred_csi':      all_pred_csi.cpu().numpy(),
+                'gt_csi':        all_gt_csi.cpu().numpy(),
+                'snr':           snr.cpu().numpy(),
+                'top1_accuracy': results['top1_accuracy'],
+                'top3_accuracy': results['top3_accuracy'],
+                'gain_loss_db':  results['median_gain_loss'],
+                'nerf2_time_ms': results['timing']['mean_ms'],
+            }
+        )
 
 if __name__ == '__main__':
 

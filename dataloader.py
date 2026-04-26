@@ -40,8 +40,13 @@ def amplitude2rssi(amplitude):
     return -100 * (1 - amplitude)
 
 
-def split_dataset(datadir, ratio=0.8, dataset_type='rfid'):
-    """random shuffle train/test set
+def split_dataset(datadir, ratio=0.8, val_ratio=0.15, dataset_type='rfid'):
+    """random shuffle train/val/test set
+    
+    ratio      : fraction of data for train+val combined (default 0.8)
+    val_ratio  : fraction of train+val to use for validation (default 0.15)
+    
+    Results in: train=68%, val=12%, test=20% of total
     """
     if dataset_type == "rfid":
         spectrum_dir = os.path.join(datadir, 'spectrum')
@@ -57,12 +62,42 @@ def split_dataset(datadir, ratio=0.8, dataset_type='rfid'):
         index = [i for i in range(np.load(csi_dir).shape[0])]
         random.shuffle(index)
 
-    train_len = int(len(index) * ratio)
-    train_index = np.array(index[:train_len])
-    test_index = np.array(index[train_len:])
+    trainval_len = int(len(index) * ratio)
+    trainval_index = np.array(index[:trainval_len])
+    test_index = np.array(index[trainval_len:])
+
+    val_len = int(len(trainval_index) * val_ratio)
+    val_index = trainval_index[:val_len]
+    train_index = trainval_index[val_len:]
 
     np.savetxt(os.path.join(datadir, "train_index.txt"), train_index, fmt='%s')
+    np.savetxt(os.path.join(datadir, "val_index.txt"), val_index, fmt='%s')
     np.savetxt(os.path.join(datadir, "test_index.txt"), test_index, fmt='%s')
+
+
+# def split_dataset(datadir, ratio=0.8, dataset_type='rfid'):
+#     """random shuffle train/test set
+#     """
+#     if dataset_type == "rfid":
+#         spectrum_dir = os.path.join(datadir, 'spectrum')
+#         spt_names = sorted([f for f in os.listdir(spectrum_dir) if f.endswith('.png')])
+#         index = [x.split('.')[0] for x in spt_names]
+#         random.shuffle(index)
+#     elif dataset_type == "ble":
+#         rssi_dir = os.path.join(datadir, 'gateway_rssi.csv')
+#         index = pd.read_csv(rssi_dir).index.values
+#         random.shuffle(index)
+#     elif dataset_type == "mimo":
+#         csi_dir = os.path.join(datadir, 'csidata.npy')
+#         index = [i for i in range(np.load(csi_dir).shape[0])]
+#         random.shuffle(index)
+
+#     train_len = int(len(index) * ratio)
+#     train_index = np.array(index[:train_len])
+#     test_index = np.array(index[train_len:])
+
+#     np.savetxt(os.path.join(datadir, "train_index.txt"), train_index, fmt='%s')
+#     np.savetxt(os.path.join(datadir, "test_index.txt"), test_index, fmt='%s')
 
 
 

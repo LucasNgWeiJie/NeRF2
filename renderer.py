@@ -197,7 +197,7 @@ class Renderer_RSSI(Renderer):
         ----------
         receive_signal : [batchsize]. abs(singal of each ray)
         """
-        wavelength = sc.c / 2.4e9
+        wavelength = sc.c / 3.5e9 # change for different frequency
         # raw2alpha = lambda raw, dists: 1.-torch.exp(-raw*dists)
         # raw2phase = lambda raw, dists: torch.exp(1j*raw*dists)
         raw2phase = lambda raw, dists: raw + 2*np.pi*dists/wavelength
